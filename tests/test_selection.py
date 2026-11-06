@@ -237,6 +237,12 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(parsed.effort, "provider-native-level")
             self.assertEqual(parsed.prompt, "hello")
 
+    def test_cli_remote_control_takes_an_optional_name(self):
+        for command in (["run", "--agent", "claude-code"], ["resume", "call_" + "a" * 32]):
+            self.assertIsNone(parse_args([*command, "--input", "-"]).remote_control)
+            self.assertEqual(parse_args([*command, "--remote-control", "--input", "-"]).remote_control, "")
+            self.assertEqual(parse_args([*command, "--remote-control=autobot-opus", "--input", "-"]).remote_control, "autobot-opus")
+
 
 class NativeSelectionHelpersTests(unittest.TestCase):
     def test_cursor_applies_parameters_then_unified_effort_with_fresh_controls(self):

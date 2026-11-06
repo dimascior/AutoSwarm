@@ -124,6 +124,39 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(engine.cancel(self.records, held)["cancel_requested"])
         self.assertEqual(engine.wait(self.records, [held])[0]["outcome"], "cancelled")
 
+    def test_claude_remote_control_is_requested_after_handshake(self):
+        trace = self.root / "remote-control-trace.jsonl"
+        call_id = self.start("claude-code", provider_args=["--selection-trace=" + str(trace)], remote_control={"name": "fixture-rc"})
+        result = engine.wait(self.records, [call_id])[0]
+        self.assertEqual(result["outcome"], "completed", result)
+        sent = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+        kinds = [value.get("request", {}).get("subtype") or value.get("type") for value in sent if "argv" not in value]
+        self.assertEqual(kinds[:3], ["initialize", "remote_control", "user"])
+        request = next(value["request"] for value in sent if value.get("request_id") == "autoswarm_remote_control")
+        self.assertEqual(request, {"subtype": "remote_control", "enabled": True, "name": "fixture-rc"})
+        state = read_json(self.records.call(call_id) / "handle.json")["remote_control"]
+        self.assertEqual(state["state"], "enabled")
+        self.assertEqual(state["response"]["session_url"], "https://claude.ai/code/fixture-session")
+        self.assertEqual(read_json(self.records.call(call_id) / "task.json")["remote_control"], {"name": "fixture-rc"})
+
+    def test_claude_remote_control_refusal_does_not_fail_the_run(self):
+        call_id = self.start("claude-code", provider_args=["remote-control-refused"], remote_control={"name": None})
+        result = engine.wait(self.records, [call_id])[0]
+        self.assertEqual(result["outcome"], "completed", result)
+        state = read_json(self.records.call(call_id) / "handle.json")["remote_control"]
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("claude.ai subscriptions", state["error"])
+
+    def test_remote_control_is_claude_code_only_and_off_by_default(self):
+        with self.assertRaises(SwarmError) as caught:
+            engine.start_call(self.records, "codex", "hello", self.root, remote_control={"name": None})
+        self.assertEqual(caught.exception.code, "invalid_selection")
+        trace = self.root / "plain-trace.jsonl"
+        call_id = self.start("claude-code", provider_args=["--selection-trace=" + str(trace)])
+        self.assertEqual(engine.wait(self.records, [call_id])[0]["outcome"], "completed")
+        self.assertNotIn("remote_control", trace.read_text(encoding="utf-8"))
+        self.assertNotIn("remote_control", read_json(self.records.call(call_id) / "handle.json"))
+
     def test_failure_is_retained_and_not_success(self):
         result = engine.wait(self.records, [self.start("claude-code", "fail")])[0]
         self.assertEqual(result["outcome"], "failed")

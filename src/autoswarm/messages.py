@@ -274,7 +274,7 @@ def wake(records, target):
         engine.start_call(records, task["provider"], "Handle the incoming AutoSwarm messages. The earlier assignment has already returned; do not repeat it.", task["workspace"],
                           parent=task.get("parent"), native_session_id=result["native_session_id"], model=task.get("model"), effort=task.get("effort"), provider_args=task.get("provider_args"),
                           previous_call=task["call_id"], return_mode="wait", delegate_approvals=task.get("delegate_approvals"),
-                          agent_id=target, message_only=True, _dispatch_locked=True)
+                          remote_control=task.get("remote_control"), agent_id=target, message_only=True, _dispatch_locked=True)
     finally:
         lease.close()
 

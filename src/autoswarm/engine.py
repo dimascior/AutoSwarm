@@ -28,8 +28,10 @@ def runtime_env(records: Records) -> dict:
     return env
 
 
-def start_call(records: Records, provider: str, prompt: str, workspace: str | Path, *, parent: dict | None = None, native_session_id: str | None = None, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, previous_call: str | None = None, return_mode: str = "native", delegate_approvals: bool | None = None, controller: str | None = None, name: str | None = None, peers: list[str] | None = None, rules: str | None = None, agent_id: str | None = None, message_only: bool = False, _dispatch_locked: bool = False) -> dict:
+def start_call(records: Records, provider: str, prompt: str, workspace: str | Path, *, parent: dict | None = None, native_session_id: str | None = None, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, previous_call: str | None = None, return_mode: str = "native", delegate_approvals: bool | None = None, remote_control: dict | None = None, controller: str | None = None, name: str | None = None, peers: list[str] | None = None, rules: str | None = None, agent_id: str | None = None, message_only: bool = False, _dispatch_locked: bool = False) -> dict:
     provider = canonical(provider)
+    if remote_control is not None and provider != "claude-code":
+        raise SwarmError("invalid_selection", "--remote-control applies only to claude-code children")
     directory_path = Path(workspace).expanduser().resolve()
     if not directory_path.is_dir():
         raise SwarmError("workspace_not_found", f"Workspace is not a directory: {directory_path}")
@@ -37,6 +39,10 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
     task = {"call_id": call_id, "provider": provider, "prompt": prompt, "workspace": str(directory_path), "parent": parent, "native_session_id": native_session_id, "model": model, "provider_args": provider_args or [], "previous_call": previous_call, "return_mode": return_mode, "created_at": now()}
     task["effort"] = effort
     task["delegate_approvals"] = delegate_approvals
+    if remote_control is not None:
+        # Claude Code Remote Control: after the handshake, native.py asks the
+        # child to mirror itself to claude.ai. Kept on the task so a resume asks again.
+        task["remote_control"] = {"name": remote_control.get("name") or None}
     approvals.delegated(records, task)
     # Validate and resolve the executable before accepting a background call.
     task["command"] = invocation(task, records.config())
@@ -148,7 +154,7 @@ def wait(records: Records, call_ids: list[str], *, any_result: bool = False, mar
         time.sleep(0.1)
 
 
-def resume(records: Records, call_id: str, prompt: str, *, parent: dict | None = None, inherit_parent: bool = True, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, return_mode: str = "native", delegate_approvals: bool | None = None) -> dict:
+def resume(records: Records, call_id: str, prompt: str, *, parent: dict | None = None, inherit_parent: bool = True, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, return_mode: str = "native", delegate_approvals: bool | None = None, remote_control: dict | None = None) -> dict:
     directory, task = records.require(call_id)
     info = inspect_call(records, call_id)
     if info["state"] == "running":
@@ -157,7 +163,7 @@ def resume(records: Records, call_id: str, prompt: str, *, parent: dict | None =
     if not session:
         raise SwarmError("session_unavailable", "Provider did not return a native session ID")
     # A result is retained in the old directory; continuing creates a new call.
-    return start_call(records, task["provider"], prompt, task["workspace"], parent=parent if parent is not None or not inherit_parent else task.get("parent"), native_session_id=session, model=model if model is not None else task.get("model"), effort=effort if effort is not None else task.get("effort"), provider_args=provider_args if provider_args is not None else task.get("provider_args"), previous_call=call_id, return_mode=return_mode, delegate_approvals=delegate_approvals if delegate_approvals is not None else task.get("delegate_approvals"), agent_id=task.get("agent_id", call_id))
+    return start_call(records, task["provider"], prompt, task["workspace"], parent=parent if parent is not None or not inherit_parent else task.get("parent"), native_session_id=session, model=model if model is not None else task.get("model"), effort=effort if effort is not None else task.get("effort"), provider_args=provider_args if provider_args is not None else task.get("provider_args"), previous_call=call_id, return_mode=return_mode, delegate_approvals=delegate_approvals if delegate_approvals is not None else task.get("delegate_approvals"), remote_control=remote_control if remote_control is not None else task.get("remote_control"), agent_id=task.get("agent_id", call_id))
 
 
 def cancel(records: Records, call_id: str) -> dict:

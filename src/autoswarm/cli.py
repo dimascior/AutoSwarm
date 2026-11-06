@@ -43,6 +43,7 @@ def parser() -> argparse.ArgumentParser:
         item.add_argument("--model", help="Native model ID for this child; omitted preserves native defaults")
         item.add_argument("--effort", help="Native reasoning effort/variant for this child; omitted preserves native defaults")
         item.add_argument("--provider-arg", action="append", default=None, help="Native argument; use --provider-arg=--flag")
+        item.add_argument("--remote-control", nargs="?", const="", metavar="NAME", help="claude-code only: mirror this child to claude.ai/code and the Claude app with Claude Code Remote Control. Name the session with --remote-control=NAME")
         item.add_argument("--delegate-approvals", choices=["on", "off"], help="Override parent approval delegation for this child (default: config, on)")
         group = item.add_mutually_exclusive_group()
         group.add_argument("--parent", help="JSON binding to the original host session")
@@ -159,7 +160,8 @@ def dispatch(args, records: Records):
             raise SwarmError("invalid_input", "Use --notify-parent with --background, or collect the foreground result directly")
         if args.notify_parent and (not callback_parent or (callback_parent.get("mode") != "hook" and not callback_parent.get("endpoint") and callback_parent.get("host") != "command")):
             raise SwarmError("parent_endpoint_required", "--notify-parent needs a usable original host binding. Omit it and collect results with wait/receive.")
-        common = {"parent": parent, "model": args.model, "effort": args.effort, "provider_args": args.provider_arg, "return_mode": "native" if args.notify_parent else "wait", "delegate_approvals": None if args.delegate_approvals is None else args.delegate_approvals == "on"}
+        common = {"parent": parent, "model": args.model, "effort": args.effort, "provider_args": args.provider_arg, "return_mode": "native" if args.notify_parent else "wait", "delegate_approvals": None if args.delegate_approvals is None else args.delegate_approvals == "on",
+                  "remote_control": None if args.remote_control is None else {"name": args.remote_control.strip() or None}}
         info = engine.start_call(records, args.agent, prompt, args.cwd, controller=args.controller, name=args.name, peers=args.allow_peer, rules=args.communication_rules, **common) if name == "run" else engine.resume(records, args.call_id, prompt, inherit_parent=not args.no_parent, **common)
         if args.background:
             return info

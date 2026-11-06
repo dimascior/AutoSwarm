@@ -294,7 +294,12 @@ else:
                     Path(marker).write_text("executed", encoding="utf-8")
                 finished("approved" if allowed else "denied")
         else:
-            if value.get("type") == "control_request":
+            if value.get("type") == "control_request" and value.get("request", {}).get("subtype") == "remote_control":
+                if "remote-control-refused" in args:
+                    emit({"type": "control_response", "response": {"subtype": "error", "request_id": value["request_id"], "error": "Remote Control is only available with claude.ai subscriptions."}})
+                else:
+                    emit({"type": "control_response", "response": {"subtype": "success", "request_id": value["request_id"], "response": {"session_url": "https://claude.ai/code/" + session}}})
+            elif value.get("type") == "control_request":
                 emit({"type": "control_response", "response": {"subtype": "success", "request_id": value["request_id"], "response": {}}})
             elif value.get("type") == "user":
                 session = value.get("session_id") or session

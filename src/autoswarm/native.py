@@ -332,11 +332,36 @@ class Native:
         elif method and "id" in event:
             self.unknown(event)
 
+    def remote_control(self):
+        """Ask Claude Code to mirror this headless child to claude.ai/code and the
+        Claude app (Remote Control), the same control request IDE and SDK hosts
+        send. Best effort: a refusal is kept on the handle and the run goes on."""
+        settings = self.task.get("remote_control")
+        if not isinstance(settings, dict):
+            return
+        request = {"subtype": "remote_control", "enabled": True}
+        if settings.get("name"):
+            request["name"] = settings["name"]
+        self.progress(self.phase, remote_control={"state": "requested", "name": settings.get("name")})
+        self.send({"type": "control_request", "request_id": "autoswarm_remote_control", "request": request})
+
+    def remote_control_answered(self, response):
+        value = {"state": "failed" if response.get("subtype") == "error" else "enabled",
+                 "name": (self.task.get("remote_control") or {}).get("name")}
+        if response.get("subtype") == "error":
+            value["error"] = str(response.get("error") or response)
+        elif isinstance(response.get("response"), dict):
+            value["response"] = response["response"]  # session link details, as Claude Code returns them
+        self.progress(self.phase, remote_control=value)
+
     def claude(self, event):
         if event.get("type") == "control_response" and event.get("response", {}).get("request_id") == "autoswarm_initialize":
             if event["response"].get("subtype") == "error":
                 raise SwarmError("native_control_error", str(event["response"]))
+            self.remote_control()
             self.continue_turn(self.initial_prompt())
+        elif event.get("type") == "control_response" and event.get("response", {}).get("request_id") == "autoswarm_remote_control":
+            self.remote_control_answered(event["response"])
         elif event.get("type") == "control_response" and event.get("response", {}).get("request_id") in self.control_errors:
             callback = self.control_errors.pop(event["response"]["request_id"])
             if event["response"].get("subtype") == "error":
