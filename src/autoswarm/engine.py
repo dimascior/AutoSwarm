@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -28,14 +29,25 @@ def runtime_env(records: Records) -> dict:
     return env
 
 
-def start_call(records: Records, provider: str, prompt: str, workspace: str | Path, *, parent: dict | None = None, native_session_id: str | None = None, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, previous_call: str | None = None, return_mode: str = "native", delegate_approvals: bool | None = None, remote_control: dict | None = None, controller: str | None = None, name: str | None = None, peers: list[str] | None = None, rules: str | None = None, agent_id: str | None = None, message_only: bool = False, _dispatch_locked: bool = False) -> dict:
+def start_call(records: Records, provider: str, prompt: str, workspace: str | Path, *, parent: dict | None = None, native_session_id: str | None = None, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, previous_call: str | None = None, return_mode: str = "native", delegate_approvals: bool | None = None, remote_control: dict | None = None, controller: str | None = None, name: str | None = None, peers: list[str] | None = None, rules: str | None = None, agent_id: str | None = None, message_only: bool = False, call_id: str | None = None, _dispatch_locked: bool = False) -> dict:
     provider = canonical(provider)
     if remote_control is not None and provider != "claude-code":
         raise SwarmError("invalid_selection", "--remote-control applies only to claude-code children")
     directory_path = Path(workspace).expanduser().resolve()
     if not directory_path.is_dir():
         raise SwarmError("workspace_not_found", f"Workspace is not a directory: {directory_path}")
-    call_id = "call_" + uuid.uuid4().hex
+    supplied_call_id = call_id is not None
+    if supplied_call_id:
+        # A caller-owned idempotency key (an orchestrator's ledger-minted
+        # id): exactly the native mint's shape, so records stay uniform.
+        # Launching is idempotent on it — an existing claim is adopted,
+        # never duplicated; the call directory is the atomic arbiter.
+        if not re.fullmatch(r"call_[a-f0-9]{32}", call_id):
+            raise SwarmError("invalid_call_id", "A supplied call id must be call_ followed by 32 lowercase hex characters")
+        if read_json(records.call(call_id) / "task.json") is not None:
+            return inspect_call(records, call_id)
+    else:
+        call_id = "call_" + uuid.uuid4().hex
     task = {"call_id": call_id, "provider": provider, "prompt": prompt, "workspace": str(directory_path), "parent": parent, "native_session_id": native_session_id, "model": model, "provider_args": provider_args or [], "previous_call": previous_call, "return_mode": return_mode, "created_at": now()}
     task["effort"] = effort
     task["delegate_approvals"] = delegate_approvals
@@ -65,7 +77,16 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
             latest_directory, _ = records.require(latest["call_id"])
             if not latest.get("idle") and read_json(latest_directory / "result.json") is None and platform.running(read_json(latest_directory / "handle.json")):
                 raise SwarmError("session_busy", "This conversation is handling work or messages; send to its stable agent_id or wait before resuming")
-        directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+        try:
+            directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+        except FileExistsError:
+            if not supplied_call_id:
+                raise
+            if read_json(directory / "task.json") is not None:
+                # Lost a concurrent claim race on the same supplied id:
+                # the winner's execution is the one; adopt it.
+                return inspect_call(records, call_id)
+            raise SwarmError("call_claim_incomplete", f"Call directory exists without a task record: {directory}")
         write_json(directory / "task.json", task)
         write_json(messages.agent_path(records, task["agent_id"]) / "agent.json", {**value, "idle": False})
         with (directory / "runner.log").open("ab") as log:

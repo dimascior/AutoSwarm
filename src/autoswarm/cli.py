@@ -34,6 +34,7 @@ def parser() -> argparse.ArgumentParser:
             item.add_argument("--name", help="Conversation name, unique under this assigning parent")
             item.add_argument("--allow-peer", action="append", default=None, help="Parent-authorized peer name/agent ID; repeat to allow several")
             item.add_argument("--communication-rules", help="Concise communication instructions from the assigning parent")
+            item.add_argument("--call-id", dest="supplied_call_id", metavar="CALL_ID", help="Caller-supplied idempotency key (call_ plus 32 lowercase hex). A repeat run with the same key adopts the existing call instead of launching a duplicate")
         else:
             item.add_argument("call_id")
         item.add_argument("prompt", nargs="?")
@@ -162,7 +163,7 @@ def dispatch(args, records: Records):
             raise SwarmError("parent_endpoint_required", "--notify-parent needs a usable original host binding. Omit it and collect results with wait/receive.")
         common = {"parent": parent, "model": args.model, "effort": args.effort, "provider_args": args.provider_arg, "return_mode": "native" if args.notify_parent else "wait", "delegate_approvals": None if args.delegate_approvals is None else args.delegate_approvals == "on",
                   "remote_control": None if args.remote_control is None else {"name": args.remote_control.strip() or None}}
-        info = engine.start_call(records, args.agent, prompt, args.cwd, controller=args.controller, name=args.name, peers=args.allow_peer, rules=args.communication_rules, **common) if name == "run" else engine.resume(records, args.call_id, prompt, inherit_parent=not args.no_parent, **common)
+        info = engine.start_call(records, args.agent, prompt, args.cwd, controller=args.controller, name=args.name, peers=args.allow_peer, rules=args.communication_rules, call_id=args.supplied_call_id, **common) if name == "run" else engine.resume(records, args.call_id, prompt, inherit_parent=not args.no_parent, **common)
         if args.background:
             return info
         values = engine.wait(records, [info["call_id"]], controller=info["controller_id"])
