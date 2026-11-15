@@ -51,6 +51,90 @@ class RuntimeTests(unittest.TestCase):
         self.ids.append(call["call_id"])
         return call["call_id"]
 
+    def test_supplied_call_id_is_exclusive_and_adoptive(self):
+        with self.assertRaises(SwarmError) as caught:
+            engine.start_call(self.records, "codex", "hello", self.root, call_id="call_short")
+        self.assertEqual(caught.exception.code, "invalid_call_id")
+        supplied = "call_" + "0123456789abcdef" * 2
+        first = engine.start_call(self.records, "codex", "hello", self.root, call_id=supplied)
+        self.ids.append(supplied)
+        self.assertEqual(first["call_id"], supplied)
+        # Same inputs: adopted, never duplicated.
+        second = engine.start_call(self.records, "codex", "hello", self.root, call_id=supplied)
+        self.assertEqual(second["call_id"], supplied)
+        self.assertEqual(read_json(self.records.call(supplied) / "task.json")["prompt"], "hello")
+        self.assertEqual(sum(1 for _, task in self.records.calls() if task["call_id"] == supplied), 1)
+        # Native minting is unchanged when no key is supplied.
+        native = self.start()
+        self.assertRegex(native, r"^call_[a-f0-9]{32}$")
+        self.assertNotEqual(native, supplied)
+
+    def test_supplied_call_id_refuses_different_execution_inputs(self):
+        supplied = "call_" + "0123456789abcdef" * 2
+        engine.start_call(self.records, "codex", "hello", self.root, call_id=supplied)
+        self.ids.append(supplied)
+        # Different prompt is refused.
+        with self.assertRaises(SwarmError) as caught:
+            engine.start_call(self.records, "codex", "a different prompt", self.root, call_id=supplied)
+        self.assertEqual(caught.exception.code, "call_id_input_mismatch")
+        self.assertIn("prompt", str(caught.exception))
+        # Different provider is refused.
+        with self.assertRaises(SwarmError) as caught:
+            engine.start_call(self.records, "claude-code", "hello", self.root, call_id=supplied)
+        self.assertEqual(caught.exception.code, "call_id_input_mismatch")
+        self.assertIn("provider", str(caught.exception))
+        # Different workspace is refused.
+        other = self.root / "other"
+        other.mkdir()
+        with self.assertRaises(SwarmError) as caught:
+            engine.start_call(self.records, "codex", "hello", other, call_id=supplied)
+        self.assertEqual(caught.exception.code, "call_id_input_mismatch")
+        self.assertIn("workspace", str(caught.exception))
+        # Original claim unchanged by all refusals.
+        self.assertEqual(read_json(self.records.call(supplied) / "task.json")["prompt"], "hello")
+
+    def test_stale_incomplete_claim_is_recovered(self):
+        bare = "call_" + "f" * 32
+        self.records.call(bare).mkdir(parents=True)
+        # A stale directory (no task.json, no process) is reclaimed.
+        info = engine.start_call(self.records, "codex", "recovered", self.root, call_id=bare)
+        self.ids.append(bare)
+        self.assertEqual(info["call_id"], bare)
+        task = read_json(self.records.call(bare) / "task.json")
+        self.assertEqual(task["prompt"], "recovered")
+        # An idempotent retry of the recovered claim adopts.
+        again = engine.start_call(self.records, "codex", "recovered", self.root, call_id=bare)
+        self.assertEqual(again["call_id"], bare)
+
+    def test_concurrent_stale_recovery_produces_exactly_one_runner(self):
+        """Two threads concurrently reclaim the same incomplete call.
+        Exactly one must spawn a runner; the other must adopt."""
+        import concurrent.futures
+        supplied = "call_" + "e" * 32
+        self.records.call(supplied).mkdir(parents=True)
+        results = {}
+        def attempt(name):
+            try:
+                return engine.start_call(self.records, "codex", "concurrent", self.root, call_id=supplied)
+            except Exception as error:
+                return error
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {pool.submit(attempt, n): n for n in ("A", "B")}
+            for future in concurrent.futures.as_completed(futures):
+                results[futures[future]] = future.result()
+        self.ids.append(supplied)
+        # Both must succeed (one spawns, one adopts).
+        for name, result in results.items():
+            self.assertNotIsInstance(result, Exception, f"Thread {name} raised: {result}")
+            self.assertEqual(result["call_id"], supplied, f"Thread {name}")
+        # Exactly one task.json, one runner, one call directory.
+        task = read_json(self.records.call(supplied) / "task.json")
+        self.assertEqual(task["prompt"], "concurrent")
+        self.assertEqual(sum(1 for _, t in self.records.calls() if t["call_id"] == supplied), 1)
+        # Wait for the single runner to complete.
+        result = engine.wait(self.records, [supplied])[0]
+        self.assertEqual(result["outcome"], "completed", result)
+
     def test_all_providers_preserve_unicode_and_native_session(self):
         for provider in BINARIES:
             with self.subTest(provider=provider):

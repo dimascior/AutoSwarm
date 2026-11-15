@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -16,6 +17,23 @@ from .providers import canonical, invocation
 from .records import Records, SwarmError, now, read_json, write_json
 
 
+def _assert_claim_inputs(existing_task, provider, prompt, workspace):
+    """Refuse reuse of a call id when the execution-defining inputs differ
+    from the original claim."""
+    mismatches = []
+    if existing_task.get("provider") != provider:
+        mismatches.append("provider")
+    if existing_task.get("prompt") != prompt:
+        mismatches.append("prompt")
+    if str(Path(existing_task.get("workspace", "")).resolve()) != workspace:
+        mismatches.append("workspace")
+    if mismatches:
+        raise SwarmError(
+            "call_id_input_mismatch",
+            "Supplied call id is bound to a different execution: "
+            + ", ".join(mismatches))
+
+
 def runtime_argv() -> list[str]:
     return [sys.executable, "-m", "autoswarm"]
 
@@ -28,14 +46,27 @@ def runtime_env(records: Records) -> dict:
     return env
 
 
-def start_call(records: Records, provider: str, prompt: str, workspace: str | Path, *, parent: dict | None = None, native_session_id: str | None = None, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, previous_call: str | None = None, return_mode: str = "native", delegate_approvals: bool | None = None, remote_control: dict | None = None, controller: str | None = None, name: str | None = None, peers: list[str] | None = None, rules: str | None = None, agent_id: str | None = None, message_only: bool = False, _dispatch_locked: bool = False) -> dict:
+def start_call(records: Records, provider: str, prompt: str, workspace: str | Path, *, parent: dict | None = None, native_session_id: str | None = None, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, previous_call: str | None = None, return_mode: str = "native", delegate_approvals: bool | None = None, remote_control: dict | None = None, controller: str | None = None, name: str | None = None, peers: list[str] | None = None, rules: str | None = None, agent_id: str | None = None, message_only: bool = False, call_id: str | None = None, _dispatch_locked: bool = False) -> dict:
     provider = canonical(provider)
     if remote_control is not None and provider != "claude-code":
         raise SwarmError("invalid_selection", "--remote-control applies only to claude-code children")
     directory_path = Path(workspace).expanduser().resolve()
     if not directory_path.is_dir():
         raise SwarmError("workspace_not_found", f"Workspace is not a directory: {directory_path}")
-    call_id = "call_" + uuid.uuid4().hex
+    supplied_call_id = call_id is not None
+    if supplied_call_id:
+        # A caller-owned idempotency key (an orchestrator's ledger-minted
+        # id): exactly the native mint's shape, so records stay uniform.
+        # Launching is idempotent on it — an existing claim is adopted,
+        # never duplicated; the call directory is the atomic arbiter.
+        if not re.fullmatch(r"call_[a-f0-9]{32}", call_id):
+            raise SwarmError("invalid_call_id", "A supplied call id must be call_ followed by 32 lowercase hex characters")
+        existing = read_json(records.call(call_id) / "task.json")
+        if existing is not None:
+            _assert_claim_inputs(existing, provider, prompt, str(directory_path))
+            return inspect_call(records, call_id)
+    else:
+        call_id = "call_" + uuid.uuid4().hex
     task = {"call_id": call_id, "provider": provider, "prompt": prompt, "workspace": str(directory_path), "parent": parent, "native_session_id": native_session_id, "model": model, "provider_args": provider_args or [], "previous_call": previous_call, "return_mode": return_mode, "created_at": now()}
     task["effort"] = effort
     task["delegate_approvals"] = delegate_approvals
@@ -65,7 +96,49 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
             latest_directory, _ = records.require(latest["call_id"])
             if not latest.get("idle") and read_json(latest_directory / "result.json") is None and platform.running(read_json(latest_directory / "handle.json")):
                 raise SwarmError("session_busy", "This conversation is handling work or messages; send to its stable agent_id or wait before resuming")
-        directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+        try:
+            directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+        except FileExistsError:
+            if not supplied_call_id:
+                raise
+            existing = read_json(directory / "task.json")
+            if existing is not None:
+                _assert_claim_inputs(existing, provider, prompt, str(directory_path))
+                return inspect_call(records, call_id)
+            # Stale incomplete claim (crash between mkdir and task.json
+            # write). Serialize recovery: the claim lock prevents two
+            # concurrent processes from both falling through to spawn.
+            try:
+                claim_lease = platform.session_lease(directory / "claim.lock")
+            except SwarmError as error:
+                if error.code != "session_busy":
+                    raise
+                # Another process is recovering this claim right now.
+                # Wait for it to write task.json, then adopt.
+                while read_json(directory / "task.json") is None:
+                    time.sleep(0.02)
+                _assert_claim_inputs(
+                    read_json(directory / "task.json"),
+                    provider, prompt, str(directory_path))
+                return inspect_call(records, call_id)
+            # We hold the claim lock. Re-check: the loser may have
+            # written task.json between our first read and lock acquire.
+            existing = read_json(directory / "task.json")
+            if existing is not None:
+                claim_lease.close()
+                _assert_claim_inputs(existing, provider, prompt, str(directory_path))
+                return inspect_call(records, call_id)
+            # Also check for a live runner (handle.json with a running
+            # process): an execution may already exist from a previous
+            # claim that wrote task.json, spawned, then had its task.json
+            # deleted or corrupted.
+            handle = read_json(directory / "handle.json")
+            if platform.running(handle):
+                claim_lease.close()
+                raise SwarmError("session_busy",
+                    "An execution may already be active for this call;"
+                    " cannot reclaim while a runner is present")
+            claim_lease.close()
         write_json(directory / "task.json", task)
         write_json(messages.agent_path(records, task["agent_id"]) / "agent.json", {**value, "idle": False})
         with (directory / "runner.log").open("ab") as log:
