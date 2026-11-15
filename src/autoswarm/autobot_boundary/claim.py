@@ -20,7 +20,8 @@ def _sha256_bytes(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def write_claim_record(directory, call_id, manifest_sha256, prompt):
+def write_claim_record(directory, call_id, manifest_sha256, prompt,
+                       provider=None):
     """Write the claim record to the call directory.
 
     Called after manifest verification passes and before the provider
@@ -32,6 +33,7 @@ def write_claim_record(directory, call_id, manifest_sha256, prompt):
         "call_id": call_id,
         "manifest_sha256": manifest_sha256,
         "prompt_sha256": _sha256_str(prompt),
+        "provider": provider,
         "claimed_utc": _now(),
         "claim_state": "CLAIMED",
     }
