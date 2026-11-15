@@ -7,6 +7,7 @@ and no duplicate runners.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -186,6 +187,100 @@ class ProcessRecoveryTests(unittest.TestCase):
                          "More than one task.json for the same call_id")
         result = engine.wait(self.records, [call_id])[0]
         self.assertEqual(result["outcome"], "completed")
+
+
+class ManifestProcessRecoveryTests(unittest.TestCase):
+    """Process-level recovery with manifest identity."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.records = _make_records(self.root)
+        self.ids = []
+
+    def tearDown(self):
+        for call_id in self.ids:
+            try:
+                engine.cancel(self.records, call_id)
+            except Exception:
+                pass
+        deadline = time.monotonic() + 10
+        while any(
+            platform.running(read_json(self.records.call(v) / "handle.json"))
+            for v in self.ids
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        cleanup_temporary(self.temporary, deadline)
+
+    def _make_manifest(self, call_id, **overrides):
+        import hashlib
+        manifest = {
+            "schema_version": "v1",
+            "kind": "ExecutionManifest",
+            "sequence_id": "sq_" + "0" * 32,
+            "attempt_id": "at_" + "0" * 32,
+            "attempt_contract_hash": "sha256:" + "a" * 64,
+            "call_id": call_id,
+            "projection_address": "sha256:" + "b" * 64,
+            "role": "builder",
+            "capability": "research",
+            "provider_assignment": {
+                "provider": "codex",
+                "selected_by": "agent_factory"
+            },
+            "constraints": {
+                "finalization_class": "READ_ONLY",
+                "evidence_requirements": [
+                    "COMMAND_GOVERNANCE", "EXECUTION_LIFECYCLE"]
+            },
+        }
+        manifest.update(overrides)
+        return json.dumps(manifest, sort_keys=True).encode("utf-8")
+
+    def test_manifest_crash_recovery_same_manifest(self):
+        """Process A creates directory and manifest, crashes before task.
+        Process B with same manifest recovers and completes the claim."""
+        call_id = "call_" + "e" * 32
+        self.ids.append(call_id)
+        manifest_bytes = self._make_manifest(call_id)
+        d = self.records.call(call_id)
+        d.mkdir(parents=True)
+        d.joinpath("manifest.json").write_bytes(manifest_bytes)
+        sha = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+        d.joinpath("manifest.sha256").write_text(sha, encoding="utf-8")
+
+        info = engine.start_call(
+            self.records, "codex", "manifest-recovery", self.root,
+            call_id=call_id, manifest_bytes=manifest_bytes)
+        self.assertEqual(info["call_id"], call_id)
+        self.assertTrue((d / "task.json").is_file())
+        result = engine.wait(self.records, [call_id])[0]
+        self.assertEqual(result["outcome"], "completed")
+
+    def test_manifest_crash_recovery_different_manifest(self):
+        """Process A's accepted manifest survives; Process B carrying a
+        different manifest is refused."""
+        call_id = "call_" + "f0" * 16
+        self.ids.append(call_id)
+        original = self._make_manifest(call_id,
+            constraints={"finalization_class": "READ_ONLY",
+                         "evidence_requirements": ["EXECUTION_LIFECYCLE"]})
+        d = self.records.call(call_id)
+        d.mkdir(parents=True)
+        d.joinpath("manifest.json").write_bytes(original)
+        sha = "sha256:" + hashlib.sha256(original).hexdigest()
+        d.joinpath("manifest.sha256").write_text(sha, encoding="utf-8")
+
+        different = self._make_manifest(call_id,
+            constraints={"finalization_class": "SOURCE_MODIFYING",
+                         "evidence_requirements": ["EXECUTION_LIFECYCLE"]})
+        from autoswarm.records import SwarmError
+        with self.assertRaises(SwarmError) as ctx:
+            engine.start_call(
+                self.records, "codex", "manifest-recovery", self.root,
+                call_id=call_id, manifest_bytes=different)
+        self.assertEqual(ctx.exception.code, "execution_identity_conflict")
+        self.assertFalse((d / "task.json").exists())
 
 
 if __name__ == "__main__":

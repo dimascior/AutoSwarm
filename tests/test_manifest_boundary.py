@@ -270,5 +270,259 @@ class EngineManifestIntegrationTests(unittest.TestCase):
         self.assertFalse((d / "claim.json").exists())
 
 
+class ClaimOrderingTests(unittest.TestCase):
+    """The manifest identity is durably accepted before task.json exists."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.records = Records(self.root / "state")
+        write_json(self.records.home / "config.json", {
+            "providers": {"codex": {
+                "command": [sys.executable, str(FIXTURE), "codex"]
+            }}
+        })
+        self.ids = []
+
+    def tearDown(self):
+        for call_id in self.ids:
+            try:
+                engine.cancel(self.records, call_id)
+            except Exception:
+                pass
+        deadline = time.monotonic() + 10
+        while any(
+            platform.running(read_json(self.records.call(v) / "handle.json"))
+            for v in self.ids
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        cleanup_temporary(self.temporary, deadline)
+
+    def test_invalid_manifest_leaves_no_task_claim(self):
+        """When the manifest is invalid, no task.json or claim.json exists
+        and a later valid manifest for the same call proceeds normally."""
+        call_id = "call_" + "7" * 32
+        self.ids.append(call_id)
+        bad = _make_manifest("call_" + "8" * 32)
+        with self.assertRaises(SwarmError) as ctx:
+            engine.start_call(
+                self.records, "codex", "ordering test", self.root,
+                call_id=call_id, manifest_bytes=bad)
+        self.assertEqual(ctx.exception.code, "manifest_invalid")
+        d = self.records.call(call_id)
+        self.assertFalse((d / "task.json").exists(),
+                         "task.json must not exist after invalid manifest")
+        self.assertFalse((d / "claim.json").exists(),
+                         "claim.json must not exist after invalid manifest")
+        good = _make_manifest(call_id)
+        info = engine.start_call(
+            self.records, "codex", "ordering test", self.root,
+            call_id=call_id, manifest_bytes=good)
+        self.assertEqual(info["call_id"], call_id)
+        self.assertTrue((d / "manifest.json").is_file())
+        self.assertTrue((d / "task.json").is_file())
+
+    def test_manifest_persisted_before_task(self):
+        """After a manifest call, manifest.json and claim.json exist
+        alongside task.json — proving the ordering."""
+        call_id = "call_" + "9" * 32
+        self.ids.append(call_id)
+        manifest_bytes = _make_manifest(call_id)
+        engine.start_call(
+            self.records, "codex", "order proof", self.root,
+            call_id=call_id, manifest_bytes=manifest_bytes)
+        d = self.records.call(call_id)
+        self.assertTrue((d / "manifest.json").is_file())
+        self.assertTrue((d / "manifest.sha256").is_file())
+        self.assertTrue((d / "claim.json").is_file())
+        self.assertTrue((d / "task.json").is_file())
+        task = read_json(d / "task.json")
+        self.assertEqual(task["call_id"], call_id)
+
+    def test_claim_record_includes_provider(self):
+        """The ExecutionClaimRecord carries the provider AutoSwarm observed."""
+        call_id = "call_" + "a0" * 16
+        self.ids.append(call_id)
+        manifest_bytes = _make_manifest(call_id)
+        engine.start_call(
+            self.records, "codex", "provider claim", self.root,
+            call_id=call_id, manifest_bytes=manifest_bytes)
+        claim = read_json(self.records.call(call_id) / "claim.json")
+        self.assertEqual(claim["provider"], "codex")
+
+
+class ManifestRecoveryTests(unittest.TestCase):
+    """Recovery when a crash leaves manifest but no task.json."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.records = Records(self.root / "state")
+        write_json(self.records.home / "config.json", {
+            "providers": {"codex": {
+                "command": [sys.executable, str(FIXTURE), "codex"]
+            }}
+        })
+        self.ids = []
+
+    def tearDown(self):
+        for call_id in self.ids:
+            try:
+                engine.cancel(self.records, call_id)
+            except Exception:
+                pass
+        deadline = time.monotonic() + 10
+        while any(
+            platform.running(read_json(self.records.call(v) / "handle.json"))
+            for v in self.ids
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        cleanup_temporary(self.temporary, deadline)
+
+    def _plant_accepted_manifest(self, call_id, manifest_bytes):
+        """Simulate crash after manifest acceptance but before task.json."""
+        d = self.records.call(call_id)
+        d.mkdir(parents=True, exist_ok=True)
+        d.joinpath("manifest.json").write_bytes(manifest_bytes)
+        d.joinpath("manifest.sha256").write_text(
+            _sha256(manifest_bytes), encoding="utf-8")
+        write_claim_record(d, call_id, _sha256(manifest_bytes),
+                           "recovery prompt", provider="codex")
+
+    def test_same_manifest_resumes_after_crash(self):
+        """After a crash that left manifest but no task, a retry with the
+        same manifest writes task.json and spawns."""
+        call_id = "call_" + "ab" * 16
+        self.ids.append(call_id)
+        manifest_bytes = _make_manifest(call_id)
+        self._plant_accepted_manifest(call_id, manifest_bytes)
+        d = self.records.call(call_id)
+        self.assertFalse((d / "task.json").exists())
+        info = engine.start_call(
+            self.records, "codex", "recovery prompt", self.root,
+            call_id=call_id, manifest_bytes=manifest_bytes)
+        self.assertEqual(info["call_id"], call_id)
+        self.assertTrue((d / "task.json").is_file())
+
+    def test_conflicting_manifest_refused_after_crash(self):
+        """After a crash that left manifest but no task, a retry with a
+        different manifest raises execution_identity_conflict and the
+        original manifest remains unchanged."""
+        call_id = "call_" + "cd" * 16
+        self.ids.append(call_id)
+        original = _make_manifest(call_id, finalization_class="READ_ONLY")
+        self._plant_accepted_manifest(call_id, original)
+        different = _make_manifest(
+            call_id, finalization_class="SOURCE_MODIFYING")
+        with self.assertRaises(SwarmError) as ctx:
+            engine.start_call(
+                self.records, "codex", "recovery prompt", self.root,
+                call_id=call_id, manifest_bytes=different)
+        self.assertEqual(ctx.exception.code, "execution_identity_conflict")
+        d = self.records.call(call_id)
+        self.assertEqual(
+            d.joinpath("manifest.json").read_bytes(), original)
+        self.assertFalse((d / "task.json").exists())
+
+
+class RetryIdentityVariants(unittest.TestCase):
+    """Retry with changed manifest fields is refused."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.records = Records(self.root / "state")
+        write_json(self.records.home / "config.json", {
+            "providers": {"codex": {
+                "command": [sys.executable, str(FIXTURE), "codex"]
+            }}
+        })
+        self.ids = []
+
+    def tearDown(self):
+        for call_id in self.ids:
+            try:
+                engine.cancel(self.records, call_id)
+            except Exception:
+                pass
+        deadline = time.monotonic() + 10
+        while any(
+            platform.running(read_json(self.records.call(v) / "handle.json"))
+            for v in self.ids
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        cleanup_temporary(self.temporary, deadline)
+
+    def _establish(self, call_id, **manifest_kwargs):
+        manifest_bytes = _make_manifest(call_id, **manifest_kwargs)
+        self.ids.append(call_id)
+        engine.start_call(
+            self.records, "codex", "variant test", self.root,
+            call_id=call_id, manifest_bytes=manifest_bytes)
+        return manifest_bytes
+
+    def _retry_with(self, call_id, **changed_kwargs):
+        m2 = _make_manifest(call_id, **changed_kwargs)
+        with self.assertRaises(SwarmError) as ctx:
+            engine.start_call(
+                self.records, "codex", "variant test", self.root,
+                call_id=call_id, manifest_bytes=m2)
+        self.assertEqual(ctx.exception.code, "execution_identity_conflict")
+
+    def test_changed_finalization_class_refused(self):
+        call_id = "call_" + "e1" * 16
+        self._establish(call_id, finalization_class="READ_ONLY")
+        self._retry_with(call_id, finalization_class="SOURCE_MODIFYING")
+
+    def test_changed_evidence_requirements_refused(self):
+        call_id = "call_" + "e2" * 16
+        m1 = _make_manifest(call_id)
+        self.ids.append(call_id)
+        engine.start_call(
+            self.records, "codex", "variant test", self.root,
+            call_id=call_id, manifest_bytes=m1)
+        manifest = json.loads(m1)
+        manifest["constraints"]["evidence_requirements"] = [
+            "EXECUTION_LIFECYCLE", "SESSION_TRANSCRIPT"]
+        m2 = json.dumps(manifest, sort_keys=True).encode("utf-8")
+        with self.assertRaises(SwarmError) as ctx:
+            engine.start_call(
+                self.records, "codex", "variant test", self.root,
+                call_id=call_id, manifest_bytes=m2)
+        self.assertEqual(ctx.exception.code, "execution_identity_conflict")
+
+    def test_changed_projection_refused(self):
+        call_id = "call_" + "e3" * 16
+        m1 = _make_manifest(call_id)
+        self.ids.append(call_id)
+        engine.start_call(
+            self.records, "codex", "variant test", self.root,
+            call_id=call_id, manifest_bytes=m1)
+        manifest = json.loads(m1)
+        manifest["projection_address"] = "sha256:" + "c" * 64
+        m2 = json.dumps(manifest, sort_keys=True).encode("utf-8")
+        with self.assertRaises(SwarmError) as ctx:
+            engine.start_call(
+                self.records, "codex", "variant test", self.root,
+                call_id=call_id, manifest_bytes=m2)
+        self.assertEqual(ctx.exception.code, "execution_identity_conflict")
+
+    def test_changed_role_transform_refused(self):
+        call_id = "call_" + "e4" * 16
+        m1 = _make_manifest(call_id)
+        self.ids.append(call_id)
+        engine.start_call(
+            self.records, "codex", "variant test", self.root,
+            call_id=call_id, manifest_bytes=m1)
+        manifest = json.loads(m1)
+        manifest["role_transform"] = {"transform_id": "custom-transform"}
+        m2 = json.dumps(manifest, sort_keys=True).encode("utf-8")
+        with self.assertRaises(SwarmError) as ctx:
+            engine.start_call(
+                self.records, "codex", "variant test", self.root,
+                call_id=call_id, manifest_bytes=m2)
+        self.assertEqual(ctx.exception.code, "execution_identity_conflict")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -44,7 +44,7 @@ def _validate_and_persist_manifest(directory, manifest_bytes, call_id,
         manifest_path.write_bytes(manifest_bytes)
         (directory / "manifest.sha256").write_text(
             digest, encoding="utf-8")
-    write_claim_record(directory, call_id, digest, prompt)
+    write_claim_record(directory, call_id, digest, prompt, provider=provider)
 
 
 def _assert_claim_inputs(existing_task, provider, prompt, workspace):
@@ -116,6 +116,7 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
     task["message_only"] = message_only
     value = messages.prepare(records, task, controller=controller, name=name, peers=peers, rules=rules, agent_id=agent_id)
     lease = None
+    claim_lease = None
     if not _dispatch_locked:
         while True:
             try:
@@ -161,13 +162,24 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
                 _assert_claim_inputs(
                     read_json(directory / "task.json"),
                     provider, prompt, str(directory_path))
+                if manifest_bytes is not None:
+                    from .autobot_boundary.verify import verify_manifest_identity
+                    conflict = verify_manifest_identity(directory, manifest_bytes)
+                    if conflict:
+                        raise SwarmError("execution_identity_conflict", conflict)
                 return inspect_call(records, call_id)
             # We hold the claim lock. Re-check: the loser may have
             # written task.json between our first read and lock acquire.
             existing = read_json(directory / "task.json")
             if existing is not None:
                 claim_lease.close()
+                claim_lease = None
                 _assert_claim_inputs(existing, provider, prompt, str(directory_path))
+                if manifest_bytes is not None:
+                    from .autobot_boundary.verify import verify_manifest_identity
+                    conflict = verify_manifest_identity(directory, manifest_bytes)
+                    if conflict:
+                        raise SwarmError("execution_identity_conflict", conflict)
                 return inspect_call(records, call_id)
             # Also check for a live runner (handle.json with a running
             # process): an execution may already exist from a previous
@@ -176,18 +188,23 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
             handle = read_json(directory / "handle.json")
             if platform.running(handle):
                 claim_lease.close()
+                claim_lease = None
                 raise SwarmError("session_busy",
                     "An execution may already be active for this call;"
                     " cannot reclaim while a runner is present")
-            claim_lease.close()
-        write_json(directory / "task.json", task)
         if manifest_bytes is not None:
             _validate_and_persist_manifest(
                 directory, manifest_bytes, call_id, provider, prompt)
+        write_json(directory / "task.json", task)
+        if claim_lease is not None:
+            claim_lease.close()
+            claim_lease = None
         write_json(messages.agent_path(records, task["agent_id"]) / "agent.json", {**value, "idle": False})
         with (directory / "runner.log").open("ab") as log:
             process = subprocess.Popen([*runtime_argv(), "_runner", call_id], env=runtime_env(records), stdin=subprocess.DEVNULL, stdout=log, stderr=log, **platform.detached_options())
     finally:
+        if claim_lease is not None:
+            claim_lease.close()
         if lease:
             lease.close()
     while not (directory / "handle.json").exists() and not (directory / "result.json").exists():
