@@ -1,6 +1,7 @@
 """Call orchestration: independent runners and files, no central service."""
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -15,6 +16,35 @@ from . import approvals, messages
 from .hosts import detect_parent
 from .providers import canonical, invocation
 from .records import Records, SwarmError, now, read_json, write_json
+
+
+def _manifest_sha256(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _validate_and_persist_manifest(directory, manifest_bytes, call_id,
+                                   provider, prompt):
+    """Validate and persist the Autobot ExecutionManifest at claim time.
+
+    Writes manifest.json, manifest.sha256, and claim.json BEFORE the
+    provider spawns. On retry, refuses if the manifest identity changed."""
+    from .autobot_boundary.verify import (
+        verify_manifest, verify_manifest_identity)
+    from .autobot_boundary.claim import write_claim_record
+    identity_conflict = verify_manifest_identity(directory, manifest_bytes)
+    if identity_conflict:
+        raise SwarmError("execution_identity_conflict", identity_conflict)
+    issues = verify_manifest(manifest_bytes, call_id, provider)
+    if issues:
+        raise SwarmError("manifest_invalid",
+                         "ExecutionManifest rejected: " + "; ".join(issues))
+    digest = _manifest_sha256(manifest_bytes)
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.exists():
+        manifest_path.write_bytes(manifest_bytes)
+        (directory / "manifest.sha256").write_text(
+            digest, encoding="utf-8")
+    write_claim_record(directory, call_id, digest, prompt)
 
 
 def _assert_claim_inputs(existing_task, provider, prompt, workspace):
@@ -46,7 +76,7 @@ def runtime_env(records: Records) -> dict:
     return env
 
 
-def start_call(records: Records, provider: str, prompt: str, workspace: str | Path, *, parent: dict | None = None, native_session_id: str | None = None, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, previous_call: str | None = None, return_mode: str = "native", delegate_approvals: bool | None = None, remote_control: dict | None = None, controller: str | None = None, name: str | None = None, peers: list[str] | None = None, rules: str | None = None, agent_id: str | None = None, message_only: bool = False, call_id: str | None = None, _dispatch_locked: bool = False) -> dict:
+def start_call(records: Records, provider: str, prompt: str, workspace: str | Path, *, parent: dict | None = None, native_session_id: str | None = None, model: str | None = None, effort: str | None = None, provider_args: list[str] | None = None, previous_call: str | None = None, return_mode: str = "native", delegate_approvals: bool | None = None, remote_control: dict | None = None, controller: str | None = None, name: str | None = None, peers: list[str] | None = None, rules: str | None = None, agent_id: str | None = None, message_only: bool = False, call_id: str | None = None, _dispatch_locked: bool = False, manifest_bytes: bytes | None = None) -> dict:
     provider = canonical(provider)
     if remote_control is not None and provider != "claude-code":
         raise SwarmError("invalid_selection", "--remote-control applies only to claude-code children")
@@ -64,6 +94,12 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
         existing = read_json(records.call(call_id) / "task.json")
         if existing is not None:
             _assert_claim_inputs(existing, provider, prompt, str(directory_path))
+            if manifest_bytes is not None:
+                from .autobot_boundary.verify import verify_manifest_identity
+                conflict = verify_manifest_identity(
+                    records.call(call_id), manifest_bytes)
+                if conflict:
+                    raise SwarmError("execution_identity_conflict", conflict)
             return inspect_call(records, call_id)
     else:
         call_id = "call_" + uuid.uuid4().hex
@@ -104,6 +140,11 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
             existing = read_json(directory / "task.json")
             if existing is not None:
                 _assert_claim_inputs(existing, provider, prompt, str(directory_path))
+                if manifest_bytes is not None:
+                    from .autobot_boundary.verify import verify_manifest_identity
+                    conflict = verify_manifest_identity(directory, manifest_bytes)
+                    if conflict:
+                        raise SwarmError("execution_identity_conflict", conflict)
                 return inspect_call(records, call_id)
             # Stale incomplete claim (crash between mkdir and task.json
             # write). Serialize recovery: the claim lock prevents two
@@ -140,6 +181,9 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
                     " cannot reclaim while a runner is present")
             claim_lease.close()
         write_json(directory / "task.json", task)
+        if manifest_bytes is not None:
+            _validate_and_persist_manifest(
+                directory, manifest_bytes, call_id, provider, prompt)
         write_json(messages.agent_path(records, task["agent_id"]) / "agent.json", {**value, "idle": False})
         with (directory / "runner.log").open("ab") as log:
             process = subprocess.Popen([*runtime_argv(), "_runner", call_id], env=runtime_env(records), stdin=subprocess.DEVNULL, stdout=log, stderr=log, **platform.detached_options())
