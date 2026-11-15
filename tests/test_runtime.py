@@ -59,23 +59,52 @@ class RuntimeTests(unittest.TestCase):
         first = engine.start_call(self.records, "codex", "hello", self.root, call_id=supplied)
         self.ids.append(supplied)
         self.assertEqual(first["call_id"], supplied)
-        # A second launch with the same key adopts; it never duplicates or
-        # rewrites the original claim.
-        second = engine.start_call(self.records, "codex", "a different prompt", self.root, call_id=supplied)
+        # Same inputs: adopted, never duplicated.
+        second = engine.start_call(self.records, "codex", "hello", self.root, call_id=supplied)
         self.assertEqual(second["call_id"], supplied)
         self.assertEqual(read_json(self.records.call(supplied) / "task.json")["prompt"], "hello")
         self.assertEqual(sum(1 for _, task in self.records.calls() if task["call_id"] == supplied), 1)
-        # A claim directory without a task record is a positive, distinct
-        # refusal, not an adoption and not a silent relaunch.
-        bare = "call_" + "f" * 32
-        self.records.call(bare).mkdir(parents=True)
-        with self.assertRaises(SwarmError) as caught:
-            engine.start_call(self.records, "codex", "hello", self.root, call_id=bare)
-        self.assertEqual(caught.exception.code, "call_claim_incomplete")
         # Native minting is unchanged when no key is supplied.
         native = self.start()
         self.assertRegex(native, r"^call_[a-f0-9]{32}$")
         self.assertNotEqual(native, supplied)
+
+    def test_supplied_call_id_refuses_different_execution_inputs(self):
+        supplied = "call_" + "0123456789abcdef" * 2
+        engine.start_call(self.records, "codex", "hello", self.root, call_id=supplied)
+        self.ids.append(supplied)
+        # Different prompt is refused.
+        with self.assertRaises(SwarmError) as caught:
+            engine.start_call(self.records, "codex", "a different prompt", self.root, call_id=supplied)
+        self.assertEqual(caught.exception.code, "call_id_input_mismatch")
+        self.assertIn("prompt", str(caught.exception))
+        # Different provider is refused.
+        with self.assertRaises(SwarmError) as caught:
+            engine.start_call(self.records, "claude-code", "hello", self.root, call_id=supplied)
+        self.assertEqual(caught.exception.code, "call_id_input_mismatch")
+        self.assertIn("provider", str(caught.exception))
+        # Different workspace is refused.
+        other = self.root / "other"
+        other.mkdir()
+        with self.assertRaises(SwarmError) as caught:
+            engine.start_call(self.records, "codex", "hello", other, call_id=supplied)
+        self.assertEqual(caught.exception.code, "call_id_input_mismatch")
+        self.assertIn("workspace", str(caught.exception))
+        # Original claim unchanged by all refusals.
+        self.assertEqual(read_json(self.records.call(supplied) / "task.json")["prompt"], "hello")
+
+    def test_stale_incomplete_claim_is_recovered(self):
+        bare = "call_" + "f" * 32
+        self.records.call(bare).mkdir(parents=True)
+        # A stale directory (no task.json, no process) is reclaimed.
+        info = engine.start_call(self.records, "codex", "recovered", self.root, call_id=bare)
+        self.ids.append(bare)
+        self.assertEqual(info["call_id"], bare)
+        task = read_json(self.records.call(bare) / "task.json")
+        self.assertEqual(task["prompt"], "recovered")
+        # An idempotent retry of the recovered claim adopts.
+        again = engine.start_call(self.records, "codex", "recovered", self.root, call_id=bare)
+        self.assertEqual(again["call_id"], bare)
 
     def test_all_providers_preserve_unicode_and_native_session(self):
         for provider in BINARIES:

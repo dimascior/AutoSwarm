@@ -17,6 +17,23 @@ from .providers import canonical, invocation
 from .records import Records, SwarmError, now, read_json, write_json
 
 
+def _assert_claim_inputs(existing_task, provider, prompt, workspace):
+    """Refuse reuse of a call id when the execution-defining inputs differ
+    from the original claim."""
+    mismatches = []
+    if existing_task.get("provider") != provider:
+        mismatches.append("provider")
+    if existing_task.get("prompt") != prompt:
+        mismatches.append("prompt")
+    if str(Path(existing_task.get("workspace", "")).resolve()) != workspace:
+        mismatches.append("workspace")
+    if mismatches:
+        raise SwarmError(
+            "call_id_input_mismatch",
+            "Supplied call id is bound to a different execution: "
+            + ", ".join(mismatches))
+
+
 def runtime_argv() -> list[str]:
     return [sys.executable, "-m", "autoswarm"]
 
@@ -44,7 +61,9 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
         # never duplicated; the call directory is the atomic arbiter.
         if not re.fullmatch(r"call_[a-f0-9]{32}", call_id):
             raise SwarmError("invalid_call_id", "A supplied call id must be call_ followed by 32 lowercase hex characters")
-        if read_json(records.call(call_id) / "task.json") is not None:
+        existing = read_json(records.call(call_id) / "task.json")
+        if existing is not None:
+            _assert_claim_inputs(existing, provider, prompt, str(directory_path))
             return inspect_call(records, call_id)
     else:
         call_id = "call_" + uuid.uuid4().hex
@@ -82,11 +101,15 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
         except FileExistsError:
             if not supplied_call_id:
                 raise
-            if read_json(directory / "task.json") is not None:
+            existing = read_json(directory / "task.json")
+            if existing is not None:
                 # Lost a concurrent claim race on the same supplied id:
                 # the winner's execution is the one; adopt it.
+                _assert_claim_inputs(existing, provider, prompt, str(directory_path))
                 return inspect_call(records, call_id)
-            raise SwarmError("call_claim_incomplete", f"Call directory exists without a task record: {directory}")
+            # Stale incomplete claim (crash between mkdir and task.json
+            # write). No process was spawned from this directory, so
+            # reclaim by falling through to write our own task.json.
         write_json(directory / "task.json", task)
         write_json(messages.agent_path(records, task["agent_id"]) / "agent.json", {**value, "idle": False})
         with (directory / "runner.log").open("ab") as log:
