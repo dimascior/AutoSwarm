@@ -106,6 +106,35 @@ class RuntimeTests(unittest.TestCase):
         again = engine.start_call(self.records, "codex", "recovered", self.root, call_id=bare)
         self.assertEqual(again["call_id"], bare)
 
+    def test_concurrent_stale_recovery_produces_exactly_one_runner(self):
+        """Two threads concurrently reclaim the same incomplete call.
+        Exactly one must spawn a runner; the other must adopt."""
+        import concurrent.futures
+        supplied = "call_" + "e" * 32
+        self.records.call(supplied).mkdir(parents=True)
+        results = {}
+        def attempt(name):
+            try:
+                return engine.start_call(self.records, "codex", "concurrent", self.root, call_id=supplied)
+            except Exception as error:
+                return error
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {pool.submit(attempt, n): n for n in ("A", "B")}
+            for future in concurrent.futures.as_completed(futures):
+                results[futures[future]] = future.result()
+        self.ids.append(supplied)
+        # Both must succeed (one spawns, one adopts).
+        for name, result in results.items():
+            self.assertNotIsInstance(result, Exception, f"Thread {name} raised: {result}")
+            self.assertEqual(result["call_id"], supplied, f"Thread {name}")
+        # Exactly one task.json, one runner, one call directory.
+        task = read_json(self.records.call(supplied) / "task.json")
+        self.assertEqual(task["prompt"], "concurrent")
+        self.assertEqual(sum(1 for _, t in self.records.calls() if t["call_id"] == supplied), 1)
+        # Wait for the single runner to complete.
+        result = engine.wait(self.records, [supplied])[0]
+        self.assertEqual(result["outcome"], "completed", result)
+
     def test_all_providers_preserve_unicode_and_native_session(self):
         for provider in BINARIES:
             with self.subTest(provider=provider):

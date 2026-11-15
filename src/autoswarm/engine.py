@@ -103,13 +103,42 @@ def start_call(records: Records, provider: str, prompt: str, workspace: str | Pa
                 raise
             existing = read_json(directory / "task.json")
             if existing is not None:
-                # Lost a concurrent claim race on the same supplied id:
-                # the winner's execution is the one; adopt it.
                 _assert_claim_inputs(existing, provider, prompt, str(directory_path))
                 return inspect_call(records, call_id)
             # Stale incomplete claim (crash between mkdir and task.json
-            # write). No process was spawned from this directory, so
-            # reclaim by falling through to write our own task.json.
+            # write). Serialize recovery: the claim lock prevents two
+            # concurrent processes from both falling through to spawn.
+            try:
+                claim_lease = platform.session_lease(directory / "claim.lock")
+            except SwarmError as error:
+                if error.code != "session_busy":
+                    raise
+                # Another process is recovering this claim right now.
+                # Wait for it to write task.json, then adopt.
+                while read_json(directory / "task.json") is None:
+                    time.sleep(0.02)
+                _assert_claim_inputs(
+                    read_json(directory / "task.json"),
+                    provider, prompt, str(directory_path))
+                return inspect_call(records, call_id)
+            # We hold the claim lock. Re-check: the loser may have
+            # written task.json between our first read and lock acquire.
+            existing = read_json(directory / "task.json")
+            if existing is not None:
+                claim_lease.close()
+                _assert_claim_inputs(existing, provider, prompt, str(directory_path))
+                return inspect_call(records, call_id)
+            # Also check for a live runner (handle.json with a running
+            # process): an execution may already exist from a previous
+            # claim that wrote task.json, spawned, then had its task.json
+            # deleted or corrupted.
+            handle = read_json(directory / "handle.json")
+            if platform.running(handle):
+                claim_lease.close()
+                raise SwarmError("session_busy",
+                    "An execution may already be active for this call;"
+                    " cannot reclaim while a runner is present")
+            claim_lease.close()
         write_json(directory / "task.json", task)
         write_json(messages.agent_path(records, task["agent_id"]) / "agent.json", {**value, "idle": False})
         with (directory / "runner.log").open("ab") as log:
